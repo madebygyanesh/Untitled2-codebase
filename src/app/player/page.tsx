@@ -799,7 +799,6 @@ export default function PlayerPage() {
 
     // Unknown type: fallback after 10s
     advanceTimerRef.current = window.setTimeout(advance, 10000)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     activeIndex,
     displayList.length,
