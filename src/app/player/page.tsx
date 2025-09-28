@@ -143,6 +143,7 @@ type FileItem = {
   name: string
   mime: string
   url: string
+  durationSeconds?: number // Add optional duration for files
 }
 
 type ScheduleItem = {
@@ -165,6 +166,14 @@ export default function PlayerPage() {
   const [schedules, setSchedules] = useState<ScheduleItem[]>([])
   const [activeIndex, setActiveIndex] = useState(0)
   const [currentCredit, setCurrentCredit] = useState(0)
+  // Add server settings state for duration defaults
+  const [serverSettings, setServerSettings] = useState({
+    autoStart: true,
+    brightness: 100,
+    orientation: 'landscape' as 'landscape' | 'portrait',
+    defaultImageDuration: 10,
+    defaultLinkDuration: 30,
+  })
   const wsRef = useRef<WebSocket | null>(null)
   const videoARef = useRef<HTMLVideoElement | null>(null)
   const videoBRef = useRef<HTMLVideoElement | null>(null)
@@ -196,6 +205,8 @@ export default function PlayerPage() {
   })())
   // NEW: visible refresh overlay state
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false)
+  // NEW: throttle refreshes to prevent rapid successive refreshes
+  const lastRefreshTimeRef = useRef<number>(0)
 
   // Audio context and volume override helpers removed due to browser policies
 
@@ -233,24 +244,39 @@ export default function PlayerPage() {
     try { localStorage.setItem('player_last_cmd_ts', String(ts)) } catch {}
   }
 
-  // Helper: do a visible refresh cycle
+  // Helper: do a controlled refresh cycle that minimizes disruption
   const doVisibleRefresh = () => {
-    console.log('Player: Performing visible refresh')
+    // Throttle refreshes - don't allow more than once every 5 seconds
+    const now = Date.now()
+    if (now - lastRefreshTimeRef.current < 5000) {
+      console.log('Player: Refresh throttled (too recent)')
+      return
+    }
+    lastRefreshTimeRef.current = now
+    
+    console.log('Player: Performing controlled refresh')
     setIsRefreshing(true)
-    // reload lists
-    load().finally(() => {
-      // brief visual indicator
+    
+    // Only reload if we're not actively playing content
+    const shouldReload = !powered || displayList.length === 0
+    
+    if (shouldReload) {
+      console.log('Player: Reloading content (no active playback)')
+      load().finally(() => {
+        // Brief visual indicator
+        window.setTimeout(() => {
+          setIsRefreshing(false)
+          console.log('Player: Controlled refresh completed')
+        }, 500) // Reduced from 700ms
+      })
+    } else {
+      console.log('Player: Skipping content reload (active playback detected)')
+      // Just clear the refresh indicator quickly
       window.setTimeout(() => {
         setIsRefreshing(false)
-        console.log('Player: Visible refresh completed')
-        
-        // After refresh, ensure auto-start triggers if needed
-        if (autoStartEnabled && !hasAutoStarted && displayList.length > 0 && powered) {
-          console.log('Player: Triggering auto-start after refresh')
-          setHasAutoStarted(false) // Reset to allow auto-start
-        }
-      }, 700)
-    })
+        console.log('Player: Refresh indicator cleared')
+      }, 200)
+    }
   }
 
   // Helper: compute current effective mute - removed due to browser policies
@@ -382,19 +408,29 @@ export default function PlayerPage() {
         console.log('Player: Updated schedules state with', s.schedules.length, 'items')
       }
       
-      // Load server settings - only brightness and orientation
+      // Load server settings - including duration defaults for proper override system
       if (settings?.settings) {
-        const serverSettings = settings.settings
-        setAutoStartEnabled(serverSettings.autoStart ?? true)
-        setBrightness(serverSettings.brightness ?? 100)
-        setOrientation(serverSettings.orientation ?? 'landscape')
+        const loadedSettings = settings.settings
+        setAutoStartEnabled(loadedSettings.autoStart ?? true)
+        setBrightness(loadedSettings.brightness ?? 100)
+        setOrientation(loadedSettings.orientation ?? 'landscape')
         
-        console.log('Player: Updated settings - autoStart:', serverSettings.autoStart, 'brightness:', serverSettings.brightness)
+        // Update server settings state for duration override system
+        setServerSettings(prev => ({
+          ...prev,
+          autoStart: loadedSettings.autoStart ?? true,
+          brightness: loadedSettings.brightness ?? 100,
+          orientation: loadedSettings.orientation ?? 'landscape',
+          defaultImageDuration: loadedSettings.defaultImageDuration ?? 10,
+          defaultLinkDuration: loadedSettings.defaultLinkDuration ?? 30,
+        }))
+        
+        console.log('Player: Updated settings - autoStart:', loadedSettings.autoStart, 'brightness:', loadedSettings.brightness, 'defaults:', { image: loadedSettings.defaultImageDuration, link: loadedSettings.defaultLinkDuration })
         
         // Save to localStorage for offline fallback
         try {
-          localStorage.setItem('player_brightness', String(serverSettings.brightness ?? 100))
-          localStorage.setItem('player_orientation', serverSettings.orientation ?? 'landscape')
+          localStorage.setItem('player_brightness', String(loadedSettings.brightness ?? 100))
+          localStorage.setItem('player_orientation', loadedSettings.orientation ?? 'landscape')
         } catch {}
       }
       
@@ -495,13 +531,15 @@ export default function PlayerPage() {
 
     connect()
 
-    // Enhanced polling for instant updates when WS is down with better error handling
-    let burstEndAt = Date.now() + 30000 // 30s burst
+    // Reduced polling frequency to prevent excessive refreshing
     const pollId = window.setInterval(() => {
       const wsOpen = !!wsRef.current && wsRef.current.readyState === WebSocket.OPEN
       if (!wsOpen) {
         console.log('Player: WebSocket disconnected, using HTTP polling for updates')
-        load() // Always refresh content
+        // Only load content if we don't have any or if powered off
+        if (displayList.length === 0 || !powered) {
+          load()
+        }
         
         // fetch and apply any queued commands via HTTP fallback
         const since = lastCmdTsRef.current || Date.now()
@@ -529,12 +567,28 @@ export default function PlayerPage() {
             console.warn('Player: Failed to fetch commands:', err)
           })
       }
-    }, 3000) // Check every 3 seconds for more frequent updates
+    }, 10000) // Increased from 3s to 10s to reduce excessive polling
 
-    // Also refresh when tab regains focus and when network returns
-    const onVisible = () => { if (document.visibilityState === 'visible') load() }
+    // Controlled refresh events to prevent unexpected refreshing
+    const onVisible = () => { 
+      if (document.visibilityState === 'visible') {
+        // Only refresh if we've been away for more than 30 seconds
+        const lastUpdate = Date.now() - (lastCmdTsRef.current || 0)
+        if (lastUpdate > 30000) {
+          console.log('Player: Tab regained focus after extended absence, refreshing')
+          load()
+        } else {
+          console.log('Player: Tab regained focus, skipping refresh (recent activity)')
+        }
+      }
+    }
+    
     const onOnline = () => {
-      load()
+      // Only refresh when coming back online if we don't have content
+      if (displayList.length === 0 || !powered) {
+        console.log('Player: Network restored, refreshing content')
+        load()
+      }
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         connect()
       }
@@ -638,8 +692,15 @@ export default function PlayerPage() {
   }, [schedules])
 
   const displayList = useMemo(() => {
-    // If no active schedule, loop all uploaded files by name
-    if (activePlaylist.length === 0) return files.map(f => ({ id: f.id, fileId: f.id, ...(Number.isFinite((f as any)?.durationSeconds) && (f as any).durationSeconds > 0 ? { durationSeconds: (f as any).durationSeconds } : {}) }))
+    // If no active schedule, loop all uploaded files by name with enhanced duration handling
+    if (activePlaylist.length === 0) {
+      return files.map(f => ({ 
+        id: f.id, 
+        fileId: f.id, 
+        // Preserve file-level duration for proper override hierarchy
+        ...(typeof (f as any)?.durationSeconds === 'number' && (f as any).durationSeconds > 0 ? { durationSeconds: (f as any).durationSeconds } : {}) 
+      }))
+    }
     return activePlaylist
   }, [activePlaylist, files])
 
@@ -693,16 +754,22 @@ export default function PlayerPage() {
     }
   }, [displayList.length, hasAutoStarted])
   
-  // Enhanced content monitoring - ensure player always shows current content
+  // Controlled content monitoring - reduce unnecessary refreshing
   useEffect(() => {
-    // Force refresh every 10 seconds to ensure we have the latest content
+    // Only refresh every 60 seconds to reduce unexpected refreshing
+    // This ensures we stay up to date without being disruptive
     const contentRefreshInterval = setInterval(() => {
-      console.log('Player: Periodic content refresh')
-      load()
-    }, 10000)
+      // Only refresh if we're not in the middle of playing content
+      if (!powered || displayList.length === 0) {
+        console.log('Player: Periodic content check (powered off or no content)')
+        load()
+      } else {
+        console.log('Player: Skipping periodic refresh (content is playing)')
+      }
+    }, 60000) // Reduced from 10s to 60s
     
     return () => clearInterval(contentRefreshInterval)
-  }, [])
+  }, [powered, displayList.length])
 
   // Advance helper with bounds guard
   const advance = () => {
@@ -847,11 +914,36 @@ export default function PlayerPage() {
     const file = files.find(f => f.id === item.fileId)
     if (!file) return
 
-    const DEFAULT_IMAGE_LINK_SEC = typeof item.durationSeconds === 'number' && item.durationSeconds > 0 ? item.durationSeconds : 10
+    // Enhanced duration override system - prioritize any specified duration
+    const getEffectiveDuration = (item: any, file: any) => {
+      // Priority 1: Schedule item duration (highest priority)
+      if (typeof item.durationSeconds === 'number' && item.durationSeconds > 0) {
+        return item.durationSeconds
+      }
+      
+      // Priority 2: File-specific duration
+      if (typeof file.durationSeconds === 'number' && file.durationSeconds > 0) {
+        return file.durationSeconds
+      }
+      
+      // Priority 3: Global defaults based on mime type
+      if (file.mime.startsWith('image/')) {
+        return serverSettings?.defaultImageDuration || 10
+      }
+      if (file.mime.startsWith('link/')) {
+        return serverSettings?.defaultLinkDuration || 30
+      }
+      
+      // Fallback for unknown types
+      return 10
+    }
 
     if (file.mime.startsWith('image/') || file.mime.startsWith('link/')) {
-      // For images/links: use configured duration (default 10s)
-      advanceTimerRef.current = window.setTimeout(advance, DEFAULT_IMAGE_LINK_SEC * 1000)
+      // For images/links: use comprehensive duration override system
+      const effectiveDuration = getEffectiveDuration(item, file)
+      console.log(`Player: ${file.mime.split('/')[0]} duration - Schedule: ${item.durationSeconds}, File: ${(file as any).durationSeconds}, Global: ${file.mime.startsWith('image/') ? (serverSettings?.defaultImageDuration || 10) : (serverSettings?.defaultLinkDuration || 30)}, Using: ${effectiveDuration}s`)
+      
+      advanceTimerRef.current = window.setTimeout(advance, Math.max(0.1, effectiveDuration) * 1000)
       // Ensure active video is paused
       try { getActiveVideo()?.pause() } catch {}
       // Preload next if it's a video
@@ -876,16 +968,30 @@ export default function PlayerPage() {
       const effectiveMutedLocal = true
       activeVideo.muted = effectiveMutedLocal
 
-      // Prepare backup/override timer: honor explicit durationSeconds when present
+      // Enhanced video duration override system
       const setBackup = () => {
         clearAdvanceTimer()
-        const overrideSec = Number((item as any)?.durationSeconds)
-        if (Number.isFinite(overrideSec) && overrideSec > 0) {
-          advanceTimerRef.current = window.setTimeout(advance, Math.max(0.1, overrideSec) * 1000)
+        
+        // Priority 1: Schedule item duration (highest priority)
+        const scheduleOverride = Number((item as any)?.durationSeconds)
+        if (Number.isFinite(scheduleOverride) && scheduleOverride > 0) {
+          console.log(`Player: Video using schedule duration override: ${scheduleOverride}s`)
+          advanceTimerRef.current = window.setTimeout(advance, Math.max(0.1, scheduleOverride) * 1000)
           return
         }
-        const dur = isFinite(activeVideo.duration) && activeVideo.duration > 0 ? activeVideo.duration : 30
-        advanceTimerRef.current = window.setTimeout(advance, (dur + 0.5) * 1000)
+        
+        // Priority 2: File-specific duration
+        const fileOverride = Number((file as any).durationSeconds)
+        if (Number.isFinite(fileOverride) && fileOverride > 0) {
+          console.log(`Player: Video using file duration override: ${fileOverride}s`)
+          advanceTimerRef.current = window.setTimeout(advance, Math.max(0.1, fileOverride) * 1000)
+          return
+        }
+        
+        // Priority 3: Natural video duration (default behavior)
+        const naturalDur = isFinite(activeVideo.duration) && activeVideo.duration > 0 ? activeVideo.duration : 30
+        console.log(`Player: Video using natural duration: ${naturalDur}s`)
+        advanceTimerRef.current = window.setTimeout(advance, (naturalDur + 0.5) * 1000)
       }
 
       if (isFinite(activeVideo.duration) && activeVideo.duration > 0) {
@@ -1002,8 +1108,8 @@ export default function PlayerPage() {
     // Broadcast immediately
     broadcastState()
     
-    // Set up regular broadcasting
-    const broadcastInterval = setInterval(broadcastState, 2000) // Every 2 seconds
+    // Reduced broadcasting frequency to prevent interference
+    const broadcastInterval = setInterval(broadcastState, 5000) // Reduced from 2s to 5s
     
     return () => clearInterval(broadcastInterval)
   }, [currentFile?.id, powered, orientation, brightness, effectiveMuted, activeVideoTag, activeIndex, files.length, schedules.length, displayList.length, autoStartEnabled, hasAutoStarted, isRefreshing])

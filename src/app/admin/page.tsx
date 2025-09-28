@@ -57,23 +57,40 @@ async function api<T>(path: string, init?: RequestInit) {
     throw new Error(errorMsg)
   }
   
-  // Robust JSON parsing with better error handling
+  // Enhanced JSON parsing with bulletproof error handling
   const ct = res.headers.get('content-type') || ''
-  if (!ct.includes('application/json')) {
-    const text = await res.text()
-    try { 
-      return JSON.parse(text) as T 
-    } catch {
-      throw new Error('Expected JSON response but got: ' + (text.substring(0, 100) || 'empty response'))
-    }
-  }
   
   try {
+    // Always attempt JSON parsing for API responses
     return (await res.json()) as T
-  } catch (err) {
-    // Clone response to read text
-    const text = await res.clone().text().catch(() => 'Unable to read response')
-    throw new Error(`JSON parsing failed: ${err instanceof Error ? err.message : 'Unknown error'}. Response: ${text.substring(0, 100)}`)
+  } catch (parseErr) {
+    // If JSON parsing fails, get the raw text to provide better error info
+    try {
+      const text = await res.clone().text()
+      console.error('Admin: JSON parsing failed for response:', {
+        url: path,
+        status: res.status,
+        contentType: ct,
+        textPreview: text.substring(0, 200),
+        parseError: parseErr instanceof Error ? parseErr.message : 'Unknown parse error'
+      })
+      
+      // If response looks like HTML error page, extract useful info
+      if (text.includes('<html') || text.includes('<!DOCTYPE')) {
+        throw new Error(`Server returned HTML instead of JSON. Check server logs for details.`)
+      }
+      
+      // If it's a short text response that doesn't look like JSON
+      if (text.length < 500 && !text.trim().startsWith('{') && !text.trim().startsWith('[')) {
+        throw new Error(`Server returned unexpected response: ${text.substring(0, 100)}`)
+      }
+      
+      // For longer responses or ones that look like malformed JSON
+      throw new Error(`JSON parsing failed: ${parseErr instanceof Error ? parseErr.message : 'Unknown error'}. Response starts with: ${text.substring(0, 100)}`)
+    } catch (textErr) {
+      // If we can't even read the response text
+      throw new Error(`Failed to parse response and couldn't read response text: ${parseErr instanceof Error ? parseErr.message : 'Unknown error'}`)
+    }
   }
 }
 
@@ -191,14 +208,22 @@ export default function AdminPage() {
         } catch {}
       }
       ws.onmessage = (e) => {
-        // refresh players/files on any signal
+        // refresh players/files on any signal with enhanced error handling
         try {
-          const msg = JSON.parse(String(e.data))
+          const msgText = String(e.data || '')
+          let msg
+          try {
+            msg = JSON.parse(msgText)
+          } catch (jsonErr) {
+            console.error('Admin WebSocket: JSON parse failed:', { data: msgText.substring(0, 200), error: jsonErr })
+            return
+          }
+          
           if (msg.type === 'refresh' || msg.type === 'heartbeat' || msg.type === 'pong') {
             loadPlayers()
           }
-        } catch {
-          // ignore
+        } catch (err) {
+          console.error('Admin WebSocket: Message handling failed:', err)
         }
       }
       ws.onclose = () => { wsRef.current = null }
@@ -339,7 +364,18 @@ export default function AdminPage() {
   async function loadPlayers() {
     try {
       const res = await fetch('/api/players')
-      const data = await res.json()
+      
+      // Enhanced JSON parsing with proper error handling
+      let data
+      try {
+        data = await res.json()
+      } catch (jsonErr) {
+        const text = await res.clone().text().catch(() => 'Unable to read response')
+        console.error('LoadPlayers: JSON parse failed:', { status: res.status, text: text.substring(0, 200), error: jsonErr })
+        setPlayers([])
+        return
+      }
+      
       if (data?.ok) {
         const now = Date.now()
         const seen = new Set<string>()
@@ -393,8 +429,22 @@ export default function AdminPage() {
         toast.error('Password is required')
         return
       }
-      const res = await fetch('/api/auth/login', { method: 'POST', body: JSON.stringify({ password }), headers: { 'content-type': 'application/json' } })
-      const data = await res.json()
+      const res = await fetch('/api/auth/login', { 
+        method: 'POST', 
+        body: JSON.stringify({ password }), 
+        headers: { 'content-type': 'application/json' } 
+      })
+      
+      // Enhanced JSON parsing with proper error handling
+      let data
+      try {
+        data = await res.json()
+      } catch (jsonErr) {
+        const text = await res.clone().text().catch(() => 'Unable to read response')
+        console.error('Login: JSON parse failed:', { status: res.status, text: text.substring(0, 200), error: jsonErr })
+        throw new Error(`Server returned invalid response. Status: ${res.status}`)
+      }
+      
       if (!res.ok || !data.ok) throw new Error(data.error || 'Login failed')
       localStorage.setItem('signage_token', data.token)
       setToken(data.token)
@@ -461,7 +511,19 @@ export default function AdminPage() {
 
     xhr.onload = async () => {
       try {
-        const res = JSON.parse(xhr.responseText || '{}')
+        // Enhanced JSON parsing for upload response
+        let res
+        try {
+          res = JSON.parse(xhr.responseText || '{}')
+        } catch (jsonErr) {
+          console.error('Upload response: JSON parse failed:', { 
+            status: xhr.status, 
+            response: (xhr.responseText || '').substring(0, 200), 
+            error: jsonErr 
+          })
+          throw new Error(`Server returned invalid response. Status: ${xhr.status}`)
+        }
+        
         if (xhr.status === 401) {
           announceUnauthorized()
           throw new Error('Unauthorized - please login again')
@@ -527,7 +589,17 @@ export default function AdminPage() {
         }),
       })
       if (res.status === 401) { announceUnauthorized(); throw new Error('Unauthorized - please login again') }
-      const data = await res.json()
+      
+      // Enhanced JSON parsing with proper error handling
+      let data
+      try {
+        data = await res.json()
+      } catch (jsonErr) {
+        const text = await res.clone().text().catch(() => 'Unable to read response')
+        console.error('AddExternalLink: JSON parse failed:', { status: res.status, text: text.substring(0, 200), error: jsonErr })
+        throw new Error(`Server returned invalid response. Status: ${res.status}`)
+      }
+      
       if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to add link')
       toast.success('Link added and ready for playback')
       setLinkName(''); setLinkUrl('')
@@ -548,7 +620,17 @@ export default function AdminPage() {
     try {
       const res = await fetch(`/api/files/${id}`, { method: 'DELETE', headers: { authorization: `Bearer ${getToken()}` } })
       if (res.status === 401) { announceUnauthorized(); throw new Error('Unauthorized - please login again') }
-      const data = await res.json()
+      
+      // Enhanced JSON parsing with proper error handling
+      let data
+      try {
+        data = await res.json()
+      } catch (jsonErr) {
+        const text = await res.clone().text().catch(() => 'Unable to read response')
+        console.error('RemoveFile: JSON parse failed:', { status: res.status, text: text.substring(0, 200), error: jsonErr })
+        throw new Error(`Server returned invalid response. Status: ${res.status}`)
+      }
+      
       if (!res.ok || !data.ok) throw new Error(data.error || 'Delete failed')
       toast.success('Deleted')
       await refresh()
@@ -603,11 +685,13 @@ export default function AdminPage() {
       const isLink = !!mime?.startsWith('link/')
       const dur = typeof durInput === 'number' ? durInput : parseInt(String(durInput || '0'), 10)
 
-      // Enforce duration rules: videos/links require, images optional
+      // Enhanced duration validation with override system
       if ((isVideo || isLink) && (!Number.isFinite(dur) || dur <= 0)) {
-        toast.error('Enter duration (seconds) before uploading videos/links')
+        toast.error(`Enter duration (seconds) before uploading ${isVideo ? 'videos' : 'links'} - required to override defaults`)
         return
       }
+      
+      console.log(`Admin: Immediate schedule - ${isVideo ? 'Video' : isLink ? 'Link' : 'Image'} with duration ${dur}s ${dur > 0 ? '(overrides defaults)' : '(uses global default)'}`)
 
       const payload: any = {
         fileId,
@@ -677,23 +761,30 @@ export default function AdminPage() {
         payload.startTime = startTime
         payload.endTime = endTime
       }
-      // include/enforce per-item duration (seconds)
+      // include/enforce per-item duration (seconds) with enhanced validation
       const dur = parseInt(durationSeconds || '0', 10)
       if (isSelectedLink) {
-        // Links: duration is mandatory
+        // Links: duration is mandatory and will override global defaults
         if (Number.isNaN(dur) || dur <= 0) {
-          return toast.error('Enter duration (seconds) for this link')
+          return toast.error('Enter duration (seconds) for this link - required to override global defaults')
         }
         payload.durationSeconds = dur
+        console.log(`Admin: Link scheduled with duration override: ${dur}s (global default: ${serverSettings.defaultLinkDuration}s)`)
       } else if (isSelectedVideo) {
-        // Videos: duration is mandatory (must play exactly for specified duration)
+        // Videos: duration is mandatory and will override natural video length
         if (Number.isNaN(dur) || dur <= 0) {
-          return toast.error('Enter duration (seconds) for this video')
+          return toast.error('Enter duration (seconds) for this video - required to override natural video duration')
         }
         payload.durationSeconds = dur
+        console.log(`Admin: Video scheduled with duration override: ${dur}s (will override natural video duration)`)
       } else {
-        // Images or others: optional duration
-        if (!Number.isNaN(dur) && dur > 0) payload.durationSeconds = dur
+        // Images: optional duration that overrides global defaults
+        if (!Number.isNaN(dur) && dur > 0) {
+          payload.durationSeconds = dur
+          console.log(`Admin: Image scheduled with duration override: ${dur}s (global default: ${serverSettings.defaultImageDuration}s)`)
+        } else {
+          console.log(`Admin: Image scheduled using global default: ${serverSettings.defaultImageDuration}s`)
+        }
       }
       const data = await api<any>('/api/schedule', { method: 'POST', body: JSON.stringify(payload), headers: { 'content-type': 'application/json' } })
       toast.success('Scheduled')
@@ -728,7 +819,17 @@ export default function AdminPage() {
     try {
       const res = await fetch(`/api/schedule?id=${encodeURIComponent(id)}`, { method: 'DELETE', headers: { authorization: `Bearer ${getToken()}` } })
       if (res.status === 401) { announceUnauthorized(); throw new Error('Unauthorized - please login again') }
-      const data = await res.json()
+      
+      // Enhanced JSON parsing with proper error handling
+      let data
+      try {
+        data = await res.json()
+      } catch (jsonErr) {
+        const text = await res.clone().text().catch(() => 'Unable to read response')
+        console.error('DeleteSchedule: JSON parse failed:', { status: res.status, text: text.substring(0, 200), error: jsonErr })
+        throw new Error(`Server returned invalid response. Status: ${res.status}`)
+      }
+      
       if (!res.ok || !data.ok) throw new Error(data.error || 'Delete failed')
       toast.success('Removed')
       await refresh()
@@ -854,11 +955,11 @@ export default function AdminPage() {
               <Input
                 type="number"
                 min={1}
-                placeholder="Duration (seconds) — required for videos/links, optional for images"
+                placeholder="Duration (seconds) — OVERRIDES global defaults"
                 value={uploadDurationSeconds}
                 onChange={(e) => setUploadDurationSeconds(e.target.value.replace(/[^0-9]/g, ''))}
               />
-              <span className="text-xs text-muted-foreground">After upload, the item will be scheduled immediately using this duration.</span>
+              <span className="text-xs text-muted-foreground">After upload, the item will be scheduled immediately using this duration. <strong>This overrides any global default settings.</strong></span>
             </div>
             <Button onClick={uploadFile}>Upload + Schedule</Button>
             <p className="text-sm text-muted-foreground">Allowed: Images and Videos up to 100MB. The file link will be available below.</p>
@@ -874,11 +975,11 @@ export default function AdminPage() {
                 <Input
                   type="number"
                   min={1}
-                  placeholder="Duration (seconds) — required for links"
+                  placeholder="Duration (seconds) — OVERRIDES global defaults"
                   value={linkDurationSeconds}
                   onChange={(e) => setLinkDurationSeconds(e.target.value.replace(/[^0-9]/g, ''))}
                 />
-                <span className="text-xs text-muted-foreground">The link will play exactly for this many seconds.</span>
+                <span className="text-xs text-muted-foreground">The link will play exactly for this many seconds. <strong>This overrides any global default settings.</strong></span>
                 <div className="text-xs text-blue-600 bg-blue-50 p-2 rounded space-y-1">
                   <div><strong>YouTube Support:</strong> Regular YouTube URLs (youtube.com/watch or youtu.be) will be automatically converted to embeddable format.</div>
                   <div><strong>Best Practice:</strong> For maximum compatibility, use direct embed URLs:</div>
@@ -976,10 +1077,10 @@ export default function AdminPage() {
               <Input type="number" value={order} onChange={(e) => setOrder(parseInt(e.target.value || '0', 10))} />
             </div>
             {/* Per-item mute for videos - REMOVED due to browser policies */}
-            {/* Video duration control: natural duration by default, or custom override */}
+            {/* Video duration control: exact override for specified duration */}
             {isSelectedVideo && (
               <div className="space-y-2">
-                <Label>Duration (seconds) — required for videos</Label>
+                <Label>Duration (seconds) — OVERRIDES natural video duration</Label>
                 <Input
                   type="number"
                   min={1}
@@ -987,13 +1088,13 @@ export default function AdminPage() {
                   value={durationSeconds}
                   onChange={(e) => setDurationSeconds(e.target.value.replace(/[^0-9]/g, ''))}
                 />
-                <p className="text-xs text-muted-foreground">Videos will be forced to play for the specified duration.</p>
+                <p className="text-xs text-muted-foreground"><strong>Videos will be forced to play for exactly the specified duration, ignoring natural video length.</strong></p>
               </div>
             )}
             {/* Per-item duration for links (required) */}
             {isSelectedLink && (
               <div className="space-y-2">
-                <Label>Duration (seconds) — required for links</Label>
+                <Label>Duration (seconds) — OVERRIDES global link defaults</Label>
                 <Input
                   type="number"
                   min={1}
@@ -1001,21 +1102,21 @@ export default function AdminPage() {
                   value={durationSeconds}
                   onChange={(e) => setDurationSeconds(e.target.value.replace(/[^0-9]/g, ''))}
                 />
-                <p className="text-xs text-muted-foreground">Links will be forced to play for the specified duration.</p>
+                <p className="text-xs text-muted-foreground"><strong>Links will be forced to play for exactly the specified duration, overriding global defaults.</strong></p>
               </div>
             )}
             {/* Optional duration for images */}
             {isSelectedImage && (
               <div className="space-y-2">
-                <Label>Duration (seconds) — optional for images</Label>
+                <Label>Duration (seconds) — OVERRIDES global image defaults</Label>
                 <Input
                   type="number"
                   min={1}
-                  placeholder="e.g. 8 (leave empty to use default)"
+                  placeholder="e.g. 8 (leave empty to use global default)"
                   value={durationSeconds}
                   onChange={(e) => setDurationSeconds(e.target.value.replace(/[^0-9]/g, ''))}
                 />
-                <p className="text-xs text-muted-foreground">If provided, the image will display for exactly this many seconds. Leave blank to use the default image duration.</p>
+                <p className="text-xs text-muted-foreground"><strong>If provided, the image will display for exactly this many seconds, overriding global defaults. Leave blank to use the global image duration setting.</strong></p>
               </div>
             )}
             <Button className="w-full sm:w-auto" onClick={addSchedule}>{scheduleButtonText}</Button>
@@ -1240,6 +1341,7 @@ export default function AdminPage() {
                     value={serverSettings.defaultImageDuration}
                     onChange={(e) => updateServerSettings({ defaultImageDuration: Number(e.target.value) || 10 })}
                   />
+                  <p className="text-xs text-muted-foreground">Used when no specific duration is provided for images.</p>
                 </div>
                 <div className="space-y-2">
                   <Label>Default Link Duration (seconds)</Label>
@@ -1250,7 +1352,18 @@ export default function AdminPage() {
                     value={serverSettings.defaultLinkDuration}
                     onChange={(e) => updateServerSettings({ defaultLinkDuration: Number(e.target.value) || 30 })}
                   />
+                  <p className="text-xs text-muted-foreground">Used when no specific duration is provided for links.</p>
                 </div>
+              </div>
+              
+              <div className="text-xs text-yellow-600 bg-yellow-50 p-3 rounded">
+                <strong>Duration Override Priority:</strong>
+                <ol className="list-decimal list-inside mt-1 space-y-1">
+                  <li><strong>Schedule duration</strong> (highest priority)</li>
+                  <li><strong>File-specific duration</strong> (medium priority)</li>
+                  <li><strong>Global defaults above</strong> (lowest priority)</li>
+                </ol>
+                <p className="mt-2">When a duration is specified anywhere (upload, link creation, scheduling), it will completely override these global defaults.</p>
               </div>
             </div>
           </div>
@@ -1362,7 +1475,7 @@ export default function AdminPage() {
                           <span> • Time {(s as any).startTime}-{(s as any).endTime}</span>
                         ) : null}
                         {(s as any).durationSeconds ? (
-                          <span> • Duration {(s as any).durationSeconds}s</span>
+                          <span className="text-blue-600 font-medium"> • Duration Override: {(s as any).durationSeconds}s</span>
                         ) : null}
                       </div>
                     </div>
