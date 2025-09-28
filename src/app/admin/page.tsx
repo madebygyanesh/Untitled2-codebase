@@ -30,27 +30,50 @@ async function api<T>(path: string, init?: RequestInit) {
       'authorization': `Bearer ${getToken()}`,
     },
   })
+  
   if (res.status === 401) {
     // Auto logout and notify listeners
     announceUnauthorized()
     throw new Error('Unauthorized - please login again')
   }
-  if (!res.ok) throw new Error(await res.text())
-  // Robust JSON parsing: fall back to text to avoid "Unexpected token '<'" crashes
+  
+  if (!res.ok) {
+    // Try to get error message from response
+    let errorMsg = `HTTP ${res.status}: ${res.statusText}`
+    try {
+      const text = await res.text()
+      if (text) {
+        try {
+          const parsed = JSON.parse(text)
+          errorMsg = parsed.error || parsed.message || errorMsg
+        } catch {
+          // If not JSON, use the text directly if it looks like an error message
+          if (text.length < 200 && !text.includes('<html')) {
+            errorMsg = text
+          }
+        }
+      }
+    } catch {}
+    throw new Error(errorMsg)
+  }
+  
+  // Robust JSON parsing with better error handling
   const ct = res.headers.get('content-type') || ''
   if (!ct.includes('application/json')) {
     const text = await res.text()
-    try { return JSON.parse(text) as T } catch {
-      throw new Error(text || 'Unexpected response from server')
+    try { 
+      return JSON.parse(text) as T 
+    } catch {
+      throw new Error('Expected JSON response but got: ' + (text.substring(0, 100) || 'empty response'))
     }
   }
+  
   try {
     return (await res.json()) as T
-  } catch {
-    const text = await res.text()
-    try { return JSON.parse(text) as T } catch {
-      throw new Error(text || 'Invalid JSON response')
-    }
+  } catch (err) {
+    // Clone response to read text
+    const text = await res.clone().text().catch(() => 'Unable to read response')
+    throw new Error(`JSON parsing failed: ${err instanceof Error ? err.message : 'Unknown error'}. Response: ${text.substring(0, 100)}`)
   }
 }
 
@@ -98,9 +121,18 @@ export default function AdminPage() {
   // Drag & drop + progress state
   const [dragActive, setDragActive] = useState(false)
   const dragCounter = useRef(0)
-  // NEW: live preview state coming from embedded /player iframe
+  // Enhanced live preview state
   const [livePreviewNowPlaying, setLivePreviewNowPlaying] = useState<string>('')
   const [livePreviewPowered, setLivePreviewPowered] = useState<boolean>(true)
+  const [livePreviewActiveIndex, setLivePreviewActiveIndex] = useState<number>(0)
+  const [livePreviewTotalFiles, setLivePreviewTotalFiles] = useState<number>(0)
+  const [livePreviewTotalSchedules, setLivePreviewTotalSchedules] = useState<number>(0)
+  const [livePreviewDisplayListLength, setLivePreviewDisplayListLength] = useState<number>(0)
+  const [livePreviewAutoStartEnabled, setLivePreviewAutoStartEnabled] = useState<boolean>(true)
+  const [livePreviewHasAutoStarted, setLivePreviewHasAutoStarted] = useState<boolean>(false)
+  const [livePreviewIsRefreshing, setLivePreviewIsRefreshing] = useState<boolean>(false)
+  const [livePreviewLastUpdate, setLivePreviewLastUpdate] = useState<number>(Date.now())
+  const [previewConnectionStatus, setPreviewConnectionStatus] = useState<'connected' | 'disconnected' | 'unknown'>('unknown')
   const previewIframeRef = useRef<HTMLIFrameElement | null>(null)
   type UploadItem = { id: string; name: string; progress: number; status: 'uploading'|'done'|'error'; error?: string }
   const [uploadItems, setUploadItems] = useState<UploadItem[]>([])
@@ -190,35 +222,57 @@ export default function AdminPage() {
     }
   }, [])
 
-  // Listen to messages from the embedded /player iframe for live preview sync
+  // Enhanced message listener for live preview sync
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       const data: any = e?.data
       if (!data || typeof data !== 'object') return
+      
       if (data.type === 'player_state') {
         try {
+          console.log('Admin: Received player state:', data)
+          
+          // Update all preview state
           setLivePreviewNowPlaying(data.nowPlaying?.name || '')
           setLivePreviewPowered(Boolean(data.powered))
-          // NOTE: Do not override local slider values from preview to prevent jumpy UI while controlling
-          // If you want one-time sync, click "Sync Preview" which will only update labels, not sliders.
-          // If needed later, we can add a dedicated "Sync Sliders" button.
-          // const now = Date.now()
-          // if (typeof data.volume === 'number') {
-          //   if (!isDraggingVolRef.current && now > suppressVolUntilRef.current) {
-          //     setVol(Math.max(0, Math.min(100, Math.round(data.volume))))
-          //   }
-          // }
-          // if (typeof data.brightness === 'number') {
-          //   if (!isDraggingBrightRef.current && now > suppressBrightUntilRef.current) {
-          //     setBright(Math.max(0, Math.min(200, Math.round(data.brightness))))
-          //   }
-          // }
-        } catch {}
+          setLivePreviewActiveIndex(data.activeIndex || 0)
+          setLivePreviewTotalFiles(data.totalFiles || 0)
+          setLivePreviewTotalSchedules(data.totalSchedules || 0)
+          setLivePreviewDisplayListLength(data.displayListLength || 0)
+          setLivePreviewAutoStartEnabled(Boolean(data.autoStartEnabled))
+          setLivePreviewHasAutoStarted(Boolean(data.hasAutoStarted))
+          setLivePreviewIsRefreshing(Boolean(data.isRefreshing))
+          setLivePreviewLastUpdate(data.timestamp || Date.now())
+          setPreviewConnectionStatus('connected')
+          
+          // Sync brightness slider if not currently dragging
+          if (typeof data.brightness === 'number' && !isDraggingBrightRef.current) {
+            const now = Date.now()
+            if (now > suppressBrightUntilRef.current) {
+              setBright(Math.max(0, Math.min(200, Math.round(data.brightness))))
+            }
+          }
+        } catch (err) {
+          console.error('Admin: Failed to process player state:', err)
+        }
       }
     }
+    
     window.addEventListener('message', onMsg)
-    return () => window.removeEventListener('message', onMsg)
-  }, [])
+    
+    // Set up connection status monitoring
+    const connectionCheckInterval = setInterval(() => {
+      const timeSinceLastUpdate = Date.now() - livePreviewLastUpdate
+      if (timeSinceLastUpdate > 10000) { // No update for 10 seconds
+        setPreviewConnectionStatus('disconnected')
+      }
+    }, 5000)
+    
+    return () => {
+      window.removeEventListener('message', onMsg)
+      clearInterval(connectionCheckInterval)
+    }
+  }, [livePreviewLastUpdate, isDraggingBrightRef, suppressBrightUntilRef])
 
   function ensureWS(): Promise<void> {
     return new Promise((resolve) => {
@@ -977,7 +1031,22 @@ export default function AdminPage() {
           <CardTitle>Live Preview</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                try {
+                  const win = previewIframeRef.current?.contentWindow
+                  win?.postMessage({ type: 'hard_refresh' }, '*')
+                  console.log('Admin: Sent hard refresh to preview')
+                } catch (err) {
+                  console.error('Admin: Failed to send hard refresh:', err)
+                }
+              }}
+            >
+              Hard Refresh
+            </Button>
             <Button
               size="sm"
               variant="secondary"
@@ -985,10 +1054,18 @@ export default function AdminPage() {
                 try {
                   const win = previewIframeRef.current?.contentWindow
                   win?.postMessage({ type: 'request_state' }, '*')
-                } catch {}
+                  console.log('Admin: Requested state from preview')
+                  
+                  // Also request immediate sync of settings
+                  setTimeout(() => {
+                    win?.postMessage({ type: 'sync_settings', settings: serverSettings }, '*')
+                  }, 100)
+                } catch (err) {
+                  console.error('Admin: Failed to sync preview:', err)
+                }
               }}
             >
-              Sync Preview
+              🔄 Sync Preview
             </Button>
           </div>
           <div className="w-full aspect-video bg-black rounded overflow-hidden">
@@ -1000,14 +1077,51 @@ export default function AdminPage() {
               allow="autoplay; fullscreen; picture-in-picture"
             />
           </div>
-          <div className="flex items-center gap-3 text-sm">
+          <div className="flex items-center gap-3 text-sm flex-wrap">
             <span className="inline-flex items-center gap-2 rounded-full bg-secondary px-3 py-1">
-              <span className={`h-2 w-2 rounded-full ${livePreviewPowered ? 'bg-green-500' : 'bg-zinc-400'}`} /> Live
+              <span className={`h-2 w-2 rounded-full ${
+                previewConnectionStatus === 'connected' ? 'bg-green-500' : 
+                previewConnectionStatus === 'disconnected' ? 'bg-red-500' : 'bg-yellow-500'
+              }`} />
+              {previewConnectionStatus === 'connected' ? 'Connected' : 
+               previewConnectionStatus === 'disconnected' ? 'Disconnected' : 'Connecting'}
             </span>
-            <span className="text-muted-foreground">Now Playing:</span>
-            <span className="font-medium truncate max-w-[40%]">{livePreviewNowPlaying || predictedNowPlaying?.name || '—'}</span>
+            
+            <span className="inline-flex items-center gap-2 rounded-full bg-secondary px-3 py-1">
+              <span className={`h-2 w-2 rounded-full ${livePreviewPowered ? 'bg-green-500' : 'bg-zinc-400'}`} />
+              {livePreviewPowered ? 'Powered On' : 'Powered Off'}
+            </span>
+            
+            {livePreviewIsRefreshing && (
+              <span className="inline-flex items-center gap-2 rounded-full bg-blue-100 text-blue-700 px-3 py-1">
+                🔄 Refreshing
+              </span>
+            )}
+            
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-2">
+                <span className="text-muted-foreground">Now Playing:</span>
+                <span className="font-medium truncate max-w-[200px]">
+                  {livePreviewNowPlaying || predictedNowPlaying?.name || '—'}
+                </span>
+              </div>
+              
+              <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                <span>Item {livePreviewActiveIndex + 1} of {livePreviewDisplayListLength || 'N/A'}</span>
+                <span>{livePreviewTotalFiles} files</span>
+                <span>{livePreviewTotalSchedules} schedules</span>
+                <span>Auto-start: {livePreviewAutoStartEnabled ? (
+                  livePreviewHasAutoStarted ? '✅ Started' : '🟡 Ready'
+                ) : '❌ Disabled'}</span>
+              </div>
+            </div>
           </div>
-          <p className="text-xs text-muted-foreground">This preview mirrors the player in real-time. The label shows the item currently playing as reported by the player; falls back to a predicted item if unavailable.</p>
+          <div className="text-xs text-muted-foreground bg-gray-50 p-3 rounded space-y-1">
+            <div><strong>Live Preview Status:</strong> This preview mirrors the player in real-time with enhanced sync.</div>
+            <div><strong>Connection:</strong> {previewConnectionStatus === 'connected' ? 'Active real-time sync' : previewConnectionStatus === 'disconnected' ? 'Sync lost - try Hard Refresh' : 'Establishing connection'}</div>
+            <div><strong>Last Update:</strong> {new Date(livePreviewLastUpdate).toLocaleTimeString()}</div>
+            <div><strong>Sync Controls:</strong> Use "Sync Preview" for immediate state sync, "Hard Refresh" to reload the preview completely.</div>
+          </div>
         </CardContent>
       </Card>
 

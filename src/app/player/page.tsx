@@ -235,11 +235,21 @@ export default function PlayerPage() {
 
   // Helper: do a visible refresh cycle
   const doVisibleRefresh = () => {
+    console.log('Player: Performing visible refresh')
     setIsRefreshing(true)
     // reload lists
     load().finally(() => {
       // brief visual indicator
-      window.setTimeout(() => setIsRefreshing(false), 700)
+      window.setTimeout(() => {
+        setIsRefreshing(false)
+        console.log('Player: Visible refresh completed')
+        
+        // After refresh, ensure auto-start triggers if needed
+        if (autoStartEnabled && !hasAutoStarted && displayList.length > 0 && powered) {
+          console.log('Player: Triggering auto-start after refresh')
+          setHasAutoStarted(false) // Reset to allow auto-start
+        }
+      }, 700)
     })
   }
 
@@ -319,22 +329,67 @@ export default function PlayerPage() {
 
   async function load() {
     try {
+      console.log('Player: Loading content from server...')
       const [fRes, sRes, settingsRes] = await Promise.all([
         fetch('/api/files'),
         fetch('/api/schedule'),
         fetch('/api/settings'),
       ])
-      const [f, s, settings] = await Promise.all([fRes.json(), sRes.json(), settingsRes.json()])
       
-      if (fRes.ok && f?.files) setFiles(f.files)
-      if (sRes.ok && s?.schedules) setSchedules(s.schedules)
+      // Enhanced error handling for each response
+      let f = null, s = null, settings = null
+      
+      if (fRes.ok) {
+        try {
+          f = await fRes.json()
+          console.log('Player: Loaded', f?.files?.length || 0, 'files')
+        } catch (err) {
+          console.error('Player: Failed to parse files response:', err)
+        }
+      } else {
+        console.error('Player: Files API returned', fRes.status, fRes.statusText)
+      }
+      
+      if (sRes.ok) {
+        try {
+          s = await sRes.json()
+          console.log('Player: Loaded', s?.schedules?.length || 0, 'schedules')
+        } catch (err) {
+          console.error('Player: Failed to parse schedules response:', err)
+        }
+      } else {
+        console.error('Player: Schedule API returned', sRes.status, sRes.statusText)
+      }
+      
+      if (settingsRes.ok) {
+        try {
+          settings = await settingsRes.json()
+          console.log('Player: Loaded settings')
+        } catch (err) {
+          console.error('Player: Failed to parse settings response:', err)
+        }
+      } else {
+        console.error('Player: Settings API returned', settingsRes.status, settingsRes.statusText)
+      }
+      
+      // Update state only if we got valid data
+      if (f?.files) {
+        setFiles(f.files)
+        console.log('Player: Updated files state with', f.files.length, 'items')
+      }
+      if (s?.schedules) {
+        setSchedules(s.schedules)
+        console.log('Player: Updated schedules state with', s.schedules.length, 'items')
+      }
       
       // Load server settings - only brightness and orientation
-      if (settingsRes.ok && settings?.settings) {
+      if (settings?.settings) {
         const serverSettings = settings.settings
         setAutoStartEnabled(serverSettings.autoStart ?? true)
         setBrightness(serverSettings.brightness ?? 100)
         setOrientation(serverSettings.orientation ?? 'landscape')
+        
+        console.log('Player: Updated settings - autoStart:', serverSettings.autoStart, 'brightness:', serverSettings.brightness)
         
         // Save to localStorage for offline fallback
         try {
@@ -342,7 +397,12 @@ export default function PlayerPage() {
           localStorage.setItem('player_orientation', serverSettings.orientation ?? 'landscape')
         } catch {}
       }
-    } catch {}
+      
+      console.log('Player: Load completed successfully')
+    } catch (err) {
+      console.error('Player: Load failed:', err)
+      // Don't throw - allow the player to continue with existing state
+    }
   }
 
   useEffect(() => {
@@ -403,13 +463,24 @@ export default function PlayerPage() {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(String(e.data))
-          if (msg.type === 'refresh') { doVisibleRefresh() }
+          console.log('Player: Received WebSocket message:', msg.type)
+          
+          if (msg.type === 'refresh') { 
+            console.log('Player: Refresh command received via WebSocket')
+            doVisibleRefresh() 
+          }
           if (msg.type === 'command') {
+            console.log('Player: Command received via WebSocket:', msg.action)
             applyCommand(msg)
             // record as processed with current time when coming via WS
             setLastCmdTs(Date.now())
           }
-        } catch {}
+          if (msg.type === 'heartbeat') {
+            console.log('Player: Heartbeat received')
+          }
+        } catch (err) {
+          console.warn('Player: Failed to parse WebSocket message:', err, e.data)
+        }
       }
 
       ws.onerror = () => {
@@ -424,34 +495,41 @@ export default function PlayerPage() {
 
     connect()
 
-    // Burst polling for near-instant updates when WS is down
+    // Enhanced polling for instant updates when WS is down with better error handling
     let burstEndAt = Date.now() + 30000 // 30s burst
     const pollId = window.setInterval(() => {
       const wsOpen = !!wsRef.current && wsRef.current.readyState === WebSocket.OPEN
       if (!wsOpen) {
-        load()
+        console.log('Player: WebSocket disconnected, using HTTP polling for updates')
+        load() // Always refresh content
+        
         // fetch and apply any queued commands via HTTP fallback
         const since = lastCmdTsRef.current || Date.now()
         fetch(`/api/commands?since=${encodeURIComponent(String(since))}`)
-          .then(r => r.ok ? r.json() : null)
+          .then(r => {
+            if (!r.ok) {
+              console.warn('Player: Commands API returned', r.status, r.statusText)
+              return null
+            }
+            return r.json()
+          })
           .then((data) => {
             if (!data || !data.commands) return
             let maxTs = since
             for (const c of data.commands) {
               if (c && typeof c.ts === 'number' && c.payload) {
+                console.log('Player: Applying command from HTTP:', c.payload.action)
                 applyCommand(c.payload)
                 if (c.ts > maxTs) maxTs = c.ts
               }
             }
             if (maxTs > since) setLastCmdTs(maxTs)
           })
-          .catch(() => {})
-        // shorten interval during burst, then slow down automatically
-        if (Date.now() < burstEndAt) {
-          // keep frequent polling by reloading interval timer if needed
-        }
+          .catch((err) => {
+            console.warn('Player: Failed to fetch commands:', err)
+          })
       }
-    }, 2000) // 2s during burst; still ok later for quick updates
+    }, 3000) // Check every 3 seconds for more frequent updates
 
     // Also refresh when tab regains focus and when network returns
     const onVisible = () => { if (document.visibilityState === 'visible') load() }
@@ -567,34 +645,64 @@ export default function PlayerPage() {
 
   // Auto-start functionality when content becomes available
   useEffect(() => {
-    if (!autoStartEnabled || hasAutoStarted || isPreview) return
+    if (isPreview) return // Don't auto-start in preview mode
+    
+    console.log('Player: Auto-start check - enabled:', autoStartEnabled, 'hasStarted:', hasAutoStarted, 'powered:', powered)
+    console.log('Player: Display list length:', displayList.length, 'Active index:', activeIndex)
+    
+    if (!autoStartEnabled || hasAutoStarted || !powered) return
     
     // Check if we have content to play
-    if (displayList.length > 0 && powered) {
+    if (displayList.length > 0) {
       const currentFile = files.find(f => f.id === (displayList[activeIndex] as any)?.fileId)
+      console.log('Player: Current file for auto-start:', currentFile?.name, currentFile?.mime)
+      
       if (currentFile) {
-        console.log('Auto-starting playbook with:', currentFile.name)
+        console.log('Player: Auto-starting playback with content:', currentFile.name)
         setHasAutoStarted(true)
         
-        // If it's a video, ensure it starts playing (always muted due to browser policies)
+        // Ensure content starts playing immediately
         if (currentFile.mime.startsWith('video/')) {
           const activeVideo = getActiveVideo()
           if (activeVideo) {
+            console.log('Player: Starting video playback')
             setTimeout(() => {
               safePlay(activeVideo)
-            }, 500) // Small delay to ensure everything is initialized
+            }, 100) // Small delay to ensure video element is ready
           }
+        } else if (currentFile.mime.startsWith('image/') || currentFile.mime.startsWith('link/')) {
+          console.log('Player: Displaying', currentFile.mime.split('/')[0], 'content')
+          // Images and links display immediately, no special action needed
         }
+      } else {
+        console.log('Player: No current file found for auto-start')
       }
+    } else {
+      console.log('Player: No content available for auto-start')
     }
   }, [displayList.length, powered, autoStartEnabled, hasAutoStarted, activeIndex, files, isPreview])
 
   // Reset auto-start flag when content changes significantly
   useEffect(() => {
     if (displayList.length === 0) {
+      console.log('Player: No content available, resetting auto-start flag')
       setHasAutoStarted(false)
+    } else if (!hasAutoStarted && displayList.length > 0) {
+      console.log('Player: Content became available, will trigger auto-start')
+      // Auto-start will be triggered by the auto-start useEffect
     }
-  }, [displayList.length])
+  }, [displayList.length, hasAutoStarted])
+  
+  // Enhanced content monitoring - ensure player always shows current content
+  useEffect(() => {
+    // Force refresh every 10 seconds to ensure we have the latest content
+    const contentRefreshInterval = setInterval(() => {
+      console.log('Player: Periodic content refresh')
+      load()
+    }, 10000)
+    
+    return () => clearInterval(contentRefreshInterval)
+  }, [])
 
   // Advance helper with bounds guard
   const advance = () => {
@@ -857,49 +965,115 @@ export default function PlayerPage() {
     return true
   }, [displayList, activeIndex])
 
-  // NEW: Post exact player state to parent (admin Live Preview) for perfect sync label
+  // Enhanced state broadcasting to parent (admin Live Preview) for perfect sync
   useEffect(() => {
     if (!isPreview) return
-    try {
-      const payload = {
-        type: 'player_state',
-        nowPlaying: currentFile ? { id: currentFile.id, name: currentFile.name, mime: currentFile.mime, url: currentFile.url } : null,
-        powered,
-        orientation,
-        brightness,
-        muted: effectiveMuted,
+    
+    const broadcastState = () => {
+      try {
+        const payload = {
+          type: 'player_state',
+          nowPlaying: currentFile ? { 
+            id: currentFile.id, 
+            name: currentFile.name, 
+            mime: currentFile.mime, 
+            url: currentFile.url 
+          } : null,
+          powered,
+          orientation,
+          brightness,
+          muted: effectiveMuted,
+          activeIndex,
+          totalFiles: files.length,
+          totalSchedules: schedules.length,
+          displayListLength: displayList.length,
+          autoStartEnabled,
+          hasAutoStarted,
+          isRefreshing,
+          timestamp: Date.now()
+        }
+        console.log('Player: Broadcasting state to admin:', payload)
+        window.parent.postMessage(payload, '*')
+      } catch (err) {
+        console.warn('Player: Failed to broadcast state:', err)
       }
-      window.parent.postMessage(payload as any, '*')
-    } catch {}
-  }, [currentFile?.id, powered, orientation, brightness, effectiveMuted, activeVideoTag, activeIndex])
+    }
+    
+    // Broadcast immediately
+    broadcastState()
+    
+    // Set up regular broadcasting
+    const broadcastInterval = setInterval(broadcastState, 2000) // Every 2 seconds
+    
+    return () => clearInterval(broadcastInterval)
+  }, [currentFile?.id, powered, orientation, brightness, effectiveMuted, activeVideoTag, activeIndex, files.length, schedules.length, displayList.length, autoStartEnabled, hasAutoStarted, isRefreshing])
 
-  // NEW: Respond to explicit state requests from admin without reloading iframe
+  // Enhanced message handling for admin sync requests
   useEffect(() => {
     if (!isPreview) return
+    
     const onMsg = (e: MessageEvent) => {
       const data: any = e?.data
       if (!data || typeof data !== 'object') return
+      
+      console.log('Player: Received message from admin:', data.type)
+      
       if (data.type === 'request_state') {
         try {
           const payload = {
             type: 'player_state',
-            nowPlaying: currentFile ? { id: currentFile.id, name: currentFile.name, mime: currentFile.mime, url: currentFile.url } : null,
+            nowPlaying: currentFile ? { 
+              id: currentFile.id, 
+              name: currentFile.name, 
+              mime: currentFile.mime, 
+              url: currentFile.url 
+            } : null,
             powered,
             orientation,
             brightness,
             muted: effectiveMuted,
+            activeIndex,
+            totalFiles: files.length,
+            totalSchedules: schedules.length,
+            displayListLength: displayList.length,
+            autoStartEnabled,
+            hasAutoStarted,
+            isRefreshing,
+            timestamp: Date.now()
           }
-          window.parent.postMessage(payload as any, '*')
-        } catch {}
+          console.log('Player: Responding to state request with:', payload)
+          window.parent.postMessage(payload, '*')
+        } catch (err) {
+          console.error('Player: Failed to respond to state request:', err)
+        }
       }
-      // New: hard refresh request from admin preview
+      
       if (data.type === 'hard_refresh') {
+        console.log('Player: Received hard refresh request')
         doVisibleRefresh()
       }
+      
+      if (data.type === 'sync_settings' && data.settings) {
+        console.log('Player: Syncing settings from admin:', data.settings)
+        try {
+          if (typeof data.settings.brightness === 'number') {
+            setBrightness(data.settings.brightness)
+          }
+          if (typeof data.settings.orientation === 'string') {
+            setOrientation(data.settings.orientation)
+          }
+          if (typeof data.settings.autoStart === 'boolean') {
+            setAutoStartEnabled(data.settings.autoStart)
+          }
+        } catch (err) {
+          console.error('Player: Failed to sync settings:', err)
+        }
+      }
     }
+    
     window.addEventListener('message', onMsg)
     return () => window.removeEventListener('message', onMsg)
-  }, [currentFile?.id, powered, orientation, brightness, effectiveMuted])
+  }, [currentFile?.id, powered, orientation, brightness, effectiveMuted, activeIndex, files.length, schedules.length, displayList.length, autoStartEnabled, hasAutoStarted, isRefreshing])
 
   // Handle seamless switch when next video has been preloaded in idle tag
   const handleActiveEnded = () => {
